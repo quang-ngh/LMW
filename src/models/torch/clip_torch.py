@@ -104,7 +104,7 @@ class VisionTransformer(nn.Module):
         else:
             self.head = nn.Identity()
 
-    def forward(self, x, interpolation=False, use_31_block=False):
+    def forward(self, x, interpolation=False, use_31_block=False, return_prehead=False):
         b = x.shape[0]
         x = rearrange(x, "b c h w -> b h w c")
         x = self.patch_embedding(x.permute(0, 3, 1, 2))
@@ -118,6 +118,9 @@ class VisionTransformer(nn.Module):
         for block in blocks:
             x = block(x)
         x = self.post_norm(x)
+        if return_prehead:
+            # Return pooled 1280-dim features for world model (before projection head).
+            return x[:, 0]
         if self.pool_type == "token":
             x = x[:, 0] @ self.head
         elif self.pool_type == "token_fc":
@@ -176,9 +179,9 @@ class CLIPModel(nn.Module):
         )
 
     def encode_video(self, videos_bcfhw):
-        """videos_bcfhw: (B, C, F, H, W) -> (B, F, D)."""
+        """videos_bcfhw: (B, C, F, H, W) -> (B, F, D). Returns 1280-dim (vision_dim) per frame for world model."""
         videos = clip_preprocess_videos_torch(videos_bcfhw, 224)
         b, c, f, h, w = videos.shape
         videos = videos.permute(0, 2, 1, 3, 4).reshape(b * f, c, h, w)
-        out = self.model(videos, use_31_block=True)
+        out = self.model(videos, use_31_block=True, return_prehead=True)
         return out.view(b, f, -1)
