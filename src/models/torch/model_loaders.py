@@ -1,7 +1,7 @@
 """Torch model constructors for loading converted checkpoints (same config as JAX)."""
 
-from src.models.torch.clip_torch import CLIPModel as TorchCLIPModel
-from src.models.torch.wan_vae_torch import WanVAETorch
+from models.torch.clip_torch import CLIPModel as TorchCLIPModel
+from models.torch.wan_vae_torch import WanVAETorch
 from src.models.torch.world_model_mp_torch import SolarisMPModelTorch
 
 
