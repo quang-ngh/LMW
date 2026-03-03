@@ -129,7 +129,8 @@ def build_eval_dataloader(
 def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, device, offload=False):
     """Load CLIP, VAE, and world model from .pt files.
     Supports both full nn.Module (torch.save(model, path)) and state_dict (torch.save(model.state_dict(), path)).
-    If offload=True, load to CPU and do not move to device (caller moves when needed).
+    Checkpoints are always loaded to CPU first to avoid GPU OOM; models are moved to device only after loading.
+    If offload=True, models stay on CPU and are moved to device only when needed by the caller.
     """
     def _is_state_dict(obj):
         if not isinstance(obj, dict):
@@ -139,7 +140,8 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
         k = next(iter(obj))
         return isinstance(k, str) and ("." in k or k in ("state_dict",))
 
-    load_device = torch.device("cpu") if offload else device
+    # Load all checkpoints on CPU to avoid GPU OOM (never materialize full checkpoint on GPU).
+    load_device = torch.device("cpu")
 
     from models.torch.clip_torch import CLIPModel as TorchCLIPModel
     from models.torch.wan_vae_torch import WanVAETorch
@@ -192,7 +194,8 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
                 out[k] = v
         return out
 
-    # Load one model at a time and free checkpoint after load to reduce peak memory (avoids OOM on world model).
+    # Load one model at a time and free checkpoint after load to reduce peak memory.
+    # All checkpoints load to CPU (load_device) so we never hold a full ckpt on GPU.
     clip_raw = torch.load(clip_checkpoint_path, map_location=load_device, weights_only=False)
     clip_is_sd = _is_state_dict(clip_raw)
     if clip_is_sd:
@@ -248,6 +251,7 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    # World model: same as above — checkpoint on CPU only.
     world_raw = torch.load(model_weights_path, map_location=load_device, weights_only=False)
     world_is_sd = _is_state_dict(world_raw)
     if world_is_sd:
