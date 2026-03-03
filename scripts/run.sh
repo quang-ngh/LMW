@@ -8,4 +8,4 @@ CUDA_VISIBLE_DEVICES=0 python -m src.inference \
   --dataset_name both_look_away     \
   --num_frames 257 \
   --eval_num_samples 1 \
-  # --offload \
+  # --offload
