@@ -148,9 +148,22 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
     except Exception:
         flax_state_dict_to_torch = None
 
+    def _needs_flax_conversion(state):
+        """True if state dict uses Flax/NNX naming (.kernel, .scale, .embedding)."""
+        if not isinstance(state, dict):
+            return False
+        for k in state:
+            if isinstance(k, str) and (
+                k.endswith(".kernel") or k.endswith(".scale") or k.endswith(".embedding")
+            ):
+                return True
+        return False
+
     def _prepare_state(state):
-        """Convert Flax-style keys to PyTorch if needed."""
-        if flax_state_dict_to_torch is not None and isinstance(state, dict):
+        """Convert Flax-style keys/shapes to PyTorch only when needed."""
+        if not isinstance(state, dict):
+            return state
+        if flax_state_dict_to_torch is not None and _needs_flax_conversion(state):
             return flax_state_dict_to_torch(state)
         return state
 

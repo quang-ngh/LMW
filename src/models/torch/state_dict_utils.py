@@ -14,8 +14,6 @@ PyTorch expects:
   - nn.Embedding: .weight (num_embeddings, features)
 """
 
-from collections import OrderedDict
-
 import torch
 
 
@@ -44,33 +42,34 @@ def _is_embedding(key: str, tensor: torch.Tensor) -> bool:
 
 
 def flax_state_dict_to_torch(flat_state_dict):
-    """Convert flat Flax/NNX state dict to PyTorch state dict."""
-    out = OrderedDict()
-    for key, tensor in flat_state_dict.items():
+    """Convert flat Flax/NNX state dict to PyTorch state dict. Modifies in place to avoid OOM."""
+    # Convert in place to avoid holding two full copies in memory
+    keys = list(flat_state_dict.keys())
+    for key in keys:
+        tensor = flat_state_dict.pop(key)
         if not isinstance(tensor, torch.Tensor):
+            flat_state_dict[key] = tensor
             continue
-        tensor = tensor.clone()
-
         if _is_linear_kernel(key, tensor):
             new_key = key.replace(".kernel", ".weight")
-            out[new_key] = tensor.t().contiguous()
+            flat_state_dict[new_key] = tensor.t().contiguous()
         elif _is_conv2d_kernel(key, tensor):
             new_key = key.replace(".kernel", ".weight")
-            out[new_key] = tensor.permute(3, 2, 0, 1).contiguous()
+            flat_state_dict[new_key] = tensor.permute(3, 2, 0, 1).contiguous()
         elif _is_conv_kernel(key, tensor):
             new_key = key.replace(".kernel", ".weight")
-            out[new_key] = tensor.permute(4, 3, 0, 1, 2).contiguous()
+            flat_state_dict[new_key] = tensor.permute(4, 3, 0, 1, 2).contiguous()
         elif key.endswith(".bias"):
-            out[key] = tensor
+            flat_state_dict[key] = tensor
         elif key.endswith(".scale"):
             new_key = key.replace(".scale", ".weight")
-            out[new_key] = tensor
+            flat_state_dict[new_key] = tensor
         elif _is_embedding(key, tensor):
             new_key = key.replace(".embedding", ".weight")
-            out[new_key] = tensor
+            flat_state_dict[new_key] = tensor
         else:
-            out[key] = tensor
-    return out
+            flat_state_dict[key] = tensor
+    return flat_state_dict
 
 
 def load_flax_ckpt_for_torch(model, ckpt_path, strict=False, map_location=None):
