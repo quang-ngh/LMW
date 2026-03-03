@@ -7,7 +7,7 @@ import torch.nn as nn
 from einops import rearrange
 
 from .rope_torch import apply_rotary_emb, get_nd_rotary_pos_embed
-from .transformer import WanRMSNorm
+from .transformer import WanRMSNorm, WanLayerNorm
 from .kv_cache_torch import KVCache
 
 
@@ -63,7 +63,7 @@ class ActionModuleTorch(nn.Module):
                 nn.Linear(frames_in, c, bias=True),
                 nn.GELU(approximate="tanh"),
                 nn.Linear(c, c),
-                nn.LayerNorm(c, eps=1e-5, elementwise_affine=True),
+                WanLayerNorm(c, eps=1e-5, elementwise_affine=True),
             )
             self.t_qkv = nn.Linear(c, c * 3, bias=qkv_bias)
             head_dim = c // heads_num

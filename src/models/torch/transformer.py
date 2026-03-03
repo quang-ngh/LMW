@@ -25,6 +25,13 @@ class WanLayerNorm(nn.LayerNorm):
     def __init__(self, num_features, eps=1e-6, elementwise_affine=True):
         super().__init__(num_features, eps=eps, elementwise_affine=elementwise_affine)
 
+    def forward(self, x):
+        dtype = x.dtype
+        if dtype == torch.bfloat16:
+            x = super().forward(x.float()).to(dtype)
+            return x
+        return super().forward(x)
+
 
 class Conv3d(nn.Module):
     """3D conv matching JAX layout: input (B, C, D, H, W), kernel (D, H, W, in_c, out_c) in JAX -> (out_c, in_c, D, H, W) in PyTorch."""
@@ -153,8 +160,16 @@ class MLPProj(nn.Module):
         self.norm1 = nn.LayerNorm(out_dim, eps=1e-5)
 
     def forward(self, x):
-        x = self.norm0(x)
+        dtype = x.dtype
+        if dtype == torch.bfloat16:
+            x = self.norm0(x.float()).to(dtype)
+        else:
+            x = self.norm0(x)
         x = self.fc1(x)
         x = torch.nn.functional.gelu(x, approximate="tanh")
         x = self.fc2(x)
-        return self.norm1(x)
+        if dtype == torch.bfloat16:
+            x = self.norm1(x.float()).to(dtype)
+        else:
+            x = self.norm1(x)
+        return x
