@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=1 python -m src.inference \
+CUDA_VISIBLE_DEVICES=0 python -m src.inference \
   --model_weights_path checkpoints_torch/solaris.pt \
   --clip_checkpoint_path checkpoints_torch/clip.pt \
   --vae_checkpoint_path checkpoints_torch/vae.pt \
