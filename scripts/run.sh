@@ -1,0 +1,11 @@
+CUDA_VISIBLE_DEVICES=1 python -m src.inference \
+  --model_weights_path checkpoints_torch/solaris.pt \
+  --clip_checkpoint_path checkpoints_torch/clip.pt \
+  --vae_checkpoint_path checkpoints_torch/vae.pt \
+  --eval_save_dir eval_out \
+  --eval_data_dir datasets/eval \
+  --test_dataset_name bothLookAwayEval/test \
+  --dataset_name both_look_away     \
+  --num_frames 257 \
+  --eval_num_samples 1 \
+  --offload

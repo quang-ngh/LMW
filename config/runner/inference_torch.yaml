@@ -1,0 +1,16 @@
+defaults:
+  - base_runner
+  - _self_
+
+# Use converted PyTorch checkpoints (.pt) with the Torch inference runner.
+# Load models directly with torch.load (no config-based init). Save full model: torch.save(model, path).
+# Example: python src/inference.py runner=inference_torch device.pretrained_model_dir=checkpoints_torch
+num_frames_eval: 257
+
+target: runners.inference_torch.InferenceTorch
+params:
+  model_weights_path: ${device.pretrained_model_dir}/solaris.pt
+  clip_checkpoint_path: ${device.pretrained_model_dir}/clip.pt
+  vae_checkpoint_path: ${device.pretrained_model_dir}/vae.pt
+  left_action_padding: 11
+  multiplayer_method: multiplayer_attn
