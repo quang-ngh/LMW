@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import gc
 import math
 import os
 import sys
@@ -191,14 +192,9 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
                 out[k] = v
         return out
 
+    # Load one model at a time and free checkpoint after load to reduce peak memory (avoids OOM on world model).
     clip_raw = torch.load(clip_checkpoint_path, map_location=load_device, weights_only=False)
-    vae_raw = torch.load(vae_checkpoint_path, map_location=load_device, weights_only=False)
-    world_raw = torch.load(model_weights_path, map_location=load_device, weights_only=False)
-
     clip_is_sd = _is_state_dict(clip_raw)
-    vae_is_sd = _is_state_dict(vae_raw)
-    world_is_sd = _is_state_dict(world_raw)
-
     if clip_is_sd:
         clip_state = _prepare_state(clip_raw.get("state_dict", clip_raw))
         clip_model = TorchCLIPModel(
@@ -219,11 +215,17 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
             norm_eps=1e-5,
         )
         clip_model.load_state_dict(clip_state, strict=False)
+        del clip_raw
     else:
         if not isinstance(clip_raw, torch.nn.Module):
             raise ValueError(f"CLIP checkpoint is not an nn.Module or state dict: {type(clip_raw)}")
         clip_model = clip_raw
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
+    vae_raw = torch.load(vae_checkpoint_path, map_location=load_device, weights_only=False)
+    vae_is_sd = _is_state_dict(vae_raw)
     if vae_is_sd:
         vae_state = _prepare_state(vae_raw.get("state_dict", vae_raw))
         vae_model = WanVAETorch(
@@ -237,11 +239,17 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
         )
         vae_state = _vae_state_align_shapes(vae_state, vae_model)
         vae_model.load_state_dict(vae_state, strict=False)
+        del vae_raw
     else:
         if not isinstance(vae_raw, torch.nn.Module):
             raise ValueError(f"VAE checkpoint is not an nn.Module or state dict: {type(vae_raw)}")
         vae_model = vae_raw
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
+    world_raw = torch.load(model_weights_path, map_location=load_device, weights_only=False)
+    world_is_sd = _is_state_dict(world_raw)
     if world_is_sd:
         world_state = _prepare_state(world_raw.get("state_dict", world_raw))
         world_model = SolarisMPModelTorch(
@@ -286,10 +294,14 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
             num_players=2,
         )
         world_model.load_state_dict(world_state, strict=False)
+        del world_raw
     else:
         if not isinstance(world_raw, torch.nn.Module):
             raise ValueError(f"World model checkpoint is not an nn.Module or state dict: {type(world_raw)}")
         world_model = world_raw
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     if offload:
         for m in (clip_model, vae_model, world_model):
