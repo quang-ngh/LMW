@@ -62,11 +62,10 @@ class MPSelfAttentionTorch(nn.Module):
             q = roped_q.transpose(1, 2)  # (B, N, S, D)
             k = roped_k.transpose(1, 2)
             v = v_BTHD.transpose(1, 2)
-            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-            if block_mask is not None:
-                attn = attn.masked_fill(~block_mask, float("-inf"))
-            attn = attn.softmax(dim=-1)
-            x_BTHD = torch.matmul(attn, v).transpose(1, 2)
+            # Use SDPA to avoid materializing full S×S attention matrix (OOM with 100k+ seq len)
+            x_BTHD = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=block_mask, scale=scale, dropout_p=0.0
+            ).transpose(1, 2)
         elif teacher_forcing:
             grid_sizes_tf = (grid_sizes[0] // 2, grid_sizes[1], grid_sizes[2])
             f_tf, s_tf = grid_sizes_tf[0], grid_sizes_tf[1] * grid_sizes_tf[2]
@@ -83,36 +82,33 @@ class MPSelfAttentionTorch(nn.Module):
                 v_BTHD = torch.cat([past_v, v_BTHD[:, Tq // 2 :]], dim=1)
             scale = self.head_dim ** -0.5
             q, k, v = roped_q.transpose(1, 2), roped_k.transpose(1, 2), v_BTHD.transpose(1, 2)
-            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-            if block_mask is not None:
-                attn = attn.masked_fill(~block_mask, float("-inf"))
-            attn = attn.softmax(dim=-1)
-            x_BTHD = torch.matmul(attn, v).transpose(1, 2)
+            x_BTHD = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=block_mask, scale=scale, dropout_p=0.0
+            ).transpose(1, 2)
         elif kv_cache is None:
             roped_q = apply_rope_mp_torch(q_BTHD, grid_sizes, freqs, f0, s0)
             roped_k = apply_rope_mp_torch(k_BTHD, grid_sizes, freqs, f0, s0)
             scale = self.head_dim ** -0.5
             q, k, v = roped_q.transpose(1, 2), roped_k.transpose(1, 2), v_BTHD.transpose(1, 2)
-            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-            if block_mask is not None:
-                attn = attn.masked_fill(~block_mask, float("-inf"))
-            attn = attn.softmax(dim=-1)
-            x_BTHD = torch.matmul(attn, v).transpose(1, 2)
+            x_BTHD = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=block_mask, scale=scale, dropout_p=0.0
+            ).transpose(1, 2)
         else:
             roped_q = apply_rope_mp_torch(q_BTHD, grid_sizes, freqs, f0, s0, current_start=current_start)
             roped_k = apply_rope_mp_torch(k_BTHD, grid_sizes, freqs, f0, s0, current_start=current_start)
             new_kv_cache = kv_cache.update(roped_k, v_BTHD)
             k, v = new_kv_cache.k, new_kv_cache.v
             kv_len = k.shape[1]
-            length = new_kv_cache.length.item() if isinstance(new_kv_cache.length, torch.Tensor) else new_kv_cache.length
-            mask_invalid = torch.arange(kv_len, device=k.device) < (kv_len - length)
-            mask_invalid = mask_invalid[None, None, None, :]
+            # SDPA: True = attend, False = mask out. Valid keys are the last `length` positions.
+            valid_len = new_kv_cache.length.item() if isinstance(new_kv_cache.length, torch.Tensor) else new_kv_cache.length
+            attn_mask = (torch.arange(kv_len, device=k.device) >= (kv_len - valid_len))[None, None, None, :]
             scale = self.head_dim ** -0.5
             q = roped_q.transpose(1, 2)
-            attn = torch.matmul(q, k.transpose(1, 2).transpose(-2, -1)) * scale
-            attn = attn.masked_fill(mask_invalid, float("-inf"))
-            attn = attn.softmax(dim=-1)
-            x_BTHD = torch.matmul(attn, v.transpose(1, 2)).transpose(1, 2)
+            k_t = k.transpose(1, 2)
+            v_t = v.transpose(1, 2)
+            x_BTHD = torch.nn.functional.scaled_dot_product_attention(
+                q, k_t, v_t, attn_mask=attn_mask, scale=scale, dropout_p=0.0
+            ).transpose(1, 2)
 
         x_BTD = rearrange(x_BTHD, "b s n d -> b s (n d)")
         return self.o(x_BTD), new_kv_cache
@@ -177,10 +173,12 @@ class SolarisMPBlockTorch(nn.Module):
         x = unpack(x)
         mod = self.modulation.to(x.dtype)[:, None, None, :, :]
         e = (mod + e).split(1, dim=3)
-        e = [e[i].squeeze(3) for i in range(6)]
+        e = [e[i].squeeze(3).unsqueeze(3) for i in range(6)]  # (b,p,f,1,c) to broadcast with (b,p,f,s,c)
+        #   Casting
+        e = [element.to(x.dtype) for element in e]
         player_embed = player_embed_PD[None, :, None, None, :].to(x.dtype)
         x = x + player_embed
-        inp = self.norm1(x.float()).to(x.dtype) * (1 + e[1]) + e[0]
+        inp = self.norm1(x) * (1 + e[1]) + e[0] 
         y_packed, new_kv_cache = self.self_attn(
             rearrange(inp, "b p f s c -> b (f p s) c"),
             grid_sizes,
@@ -195,7 +193,7 @@ class SolarisMPBlockTorch(nn.Module):
         )
         y = rearrange(y_packed, "b (f p s) c -> b p f s c", f=num_frames, p=p)
         x = x + y * e[2]
-        x_norm = self.norm3(x.float()).to(x.dtype)
+        x_norm = self.norm3(x)
         x = x + rearrange(
             self.cross_attn(
                 rearrange(x_norm, "b p f s c -> (b p) (f s) c"),
@@ -226,7 +224,9 @@ class SolarisMPBlockTorch(nn.Module):
         else:
             new_kv_mouse = kv_cache_mouse
             new_kv_keyboard = kv_cache_keyboard
-        y_ffn = self.ffn(self.norm2(x.float()).to(x.dtype) * (1 + e[4]) + e[3]) * e[5]
+        y_ffn = self.norm2(x).float() * (1 + e[4]) + e[3]
+        y_ffn = self.ffn(y_ffn.to(x.dtype)) * e[5]
+        y_ffn = y_ffn.to(x.dtype)
         x = x + y_ffn
         return pack(x), new_kv_cache, new_kv_mouse, new_kv_keyboard
 
@@ -245,8 +245,9 @@ class OutputHeadTorch(nn.Module):
         f = e.shape[2]
         mod = self.modulation.to(x.dtype)[:, None, None, :]
         e = (mod + e).split(1, dim=3)
-        e = [e[i].squeeze(3) for i in range(2)]
-        norm_x = self.norm(x.float()).to(x.dtype)
+        e = [e[i].squeeze(3).unsqueeze(3) for i in range(2)]  # (b,p,f,1,dim) to broadcast with (b,p,f,s,c)
+        e = [element.to(x.dtype) for element in e]
+        norm_x = self.norm(x)
         norm_x_frames = rearrange(norm_x, "b p (f s) c -> b p f s c", f=f)
         modulated = norm_x_frames * (1 + e[1]) + e[0]
         return self.head(modulated)
@@ -427,7 +428,9 @@ class SolarisMPModelTorch(nn.Module):
         )
         n_frames, num_patches = grid_sizes[0], grid_sizes[1] * grid_sizes[2]
         player_embed_PD = self.player_embed(torch.arange(p, device=x_BPFC.device)).to(x_BPFC.dtype)
-        freqs = rope_params_mp(self.d, device=x_BPFC.device)
+        # Use the attention layer's head_dim so RoPE matches q/k after load_state_dict(strict=False)
+        head_dim = self.blocks[0].self_attn.head_dim
+        freqs = rope_params_mp(head_dim, device=x_BPFC.device)
 
         if bidirectional:
             block_mask = block_mask_mouse = block_mask_keyboard = None
@@ -487,6 +490,12 @@ class SolarisMPModelTorch(nn.Module):
             p=t_BPT.shape[1],
             r=1,
         )
+
+        if isinstance(e_head, list) or isinstance(e_head, tuple):
+            e_head = [element.to(x_BPFC.dtype) for element in e_head]
+        else:
+            e_head = e_head.to(x_BPFC.dtype)
+
         x_BPFC = self.head(x_BPFC, e_head)
         out = self.unpatchify(x_BPFC, grid_sizes)
         new_kv = (kv_c, kv_m, kv_k) if kv_cache is not None else (None, None, None)

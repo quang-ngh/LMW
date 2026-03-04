@@ -69,8 +69,8 @@ class RMS_norm(nn.Module):
 
     def forward(self, x):
         # x: (N,...,C) or (N,T,H,W,C) for 5d
-        norm = x.float().norm(dim=-1, keepdim=True).clamp(min=1e-12)
-        out = (x.float() / norm * self.scale * self.gamma.view(-1))
+        norm = x.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+        out = (x / norm * self.scale * self.gamma.view(-1))
         if self.bias is not None:
             out = out + self.bias.view(-1)
         return out.to(x.dtype)
@@ -218,9 +218,9 @@ class AttentionBlock(nn.Module):
         qkv = rearrange(qkv, "b (c nh) h w -> b (h w) nh c", nh=1)
         q, k, v = qkv.chunk(3, dim=-1)
         scale = 1.0 / math.sqrt(c)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = attn.softmax(dim=-1)
-        x = torch.matmul(attn, v)
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, scale=scale, dropout_p=0.0
+        )
         x = rearrange(x, "b (h w) nh c -> b h w (c nh)", h=h, w=w)
         x = self.proj(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
         x = rearrange(x, "(b t) h w c -> b t h w c", t=t)
@@ -514,3 +514,28 @@ class WanVAETorch(nn.Module):
             end = start + out_i.shape[1]
             out[:, start:end] = out_i
         return out
+
+    def decode_chunk(self, x, scale=None, decoder_cache=None):
+        """Decode a chunk of latent frames (N, T_chunk, h, w, c). Returns (out, new_cache).
+        Use decoder_cache from previous decode_chunk call to continue decoding (causal)."""
+        x = self._unapply_scale(x, scale)
+        n, t_chunk, h, w, c = x.shape
+        x = x.permute(0, 4, 1, 2, 3)
+        x = self.conv2(x)
+        x = x.permute(0, 2, 3, 4, 1)
+        cache = decoder_cache if decoder_cache is not None else get_cache(self.decoder)
+        out0, cache = self.decoder(x[:, :1, :, :, :], feat_cache=cache)
+        cache = _pad_cache_time_to(cache, T=CACHE_T)
+        out = torch.zeros(
+            out0.shape[0], (t_chunk - 1) * 4 + 1, *out0.shape[2:],
+            device=x.device, dtype=out0.dtype,
+        )
+        out[:, :1] = out0
+        for i in range(1, t_chunk):
+            chunk = x[:, i : i + 1, :, :, :]
+            out_i, cache = self.decoder(chunk, feat_cache=cache)
+            cache = _pad_cache_time_to(cache, T=CACHE_T)
+            start = 1 + 4 * (i - 1)
+            end = start + out_i.shape[1]
+            out[:, start:end] = out_i
+        return out, cache

@@ -14,7 +14,7 @@ import gc
 import math
 import os
 import sys
-
+from tqdm import tqdm
 import numpy as np
 import torch
 from einops import rearrange, repeat
@@ -170,6 +170,16 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
             return flax_state_dict_to_torch(state)
         return state
 
+    def _clip_state_align_keys(state):
+        """Remap checkpoint keys to match Torch CLIP: mlp.layers.0/2 -> mlp.0/2. Drop keys model doesn't have."""
+        if not isinstance(state, dict):
+            return state
+        out = {}
+        for k, v in state.items():
+            new_k = k.replace(".mlp.layers.0.", ".mlp.0.").replace(".mlp.layers.2.", ".mlp.2.")
+            out[new_k] = v
+        return out
+
     def _vae_state_align_shapes(state, model):
         """Align .gamma/.bias shapes: checkpoint may have (C,1,1,1) or (C,1,1); match model param shape."""
         model_sd = model.state_dict()
@@ -194,12 +204,318 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
                 out[k] = v
         return out
 
+    def _vae_state_align_conv_keys(state):
+        """Remap VAE checkpoint keys: CausalConv3d uses .conv submodule, so X.weight -> X.conv.weight."""
+        if not isinstance(state, dict):
+            return state
+        out = {}
+        for k, v in state.items():
+            if not isinstance(v, torch.Tensor):
+                continue
+            if ".conv." in k:
+                out[k] = v
+                continue
+            if k.endswith(".weight"):
+                prefix = k[:-7]
+            elif k.endswith(".bias"):
+                prefix = k[:-5]
+            else:
+                out[k] = v
+                continue
+            need_conv = (
+                prefix == "conv1" or prefix == "conv2"
+                or prefix.endswith(".conv1") or prefix.endswith(".conv2")
+                or prefix.endswith(".residual.2") or prefix.endswith(".residual.6")
+                or prefix.endswith(".shortcut") or prefix.endswith(".time_conv")
+                or prefix.endswith(".head.2")
+            )
+            if need_conv:
+                new_k = prefix + ".conv." + ("weight" if k.endswith(".weight") else "bias")
+                out[new_k] = v
+            else:
+                out[k] = v
+        return out
+
+    def _world_model_mp_state_align(state, num_blocks=30):
+        """Align Flax/JAX-style world model checkpoint keys to Torch SolarisMPModelTorch.
+        Expects state already passed through _prepare_state (Flax .kernel->.weight etc).
+        Converts .layers.N->.N, patch_embedding->patch_embedding.conv,
+        img_emb.proj.N->img_emb.norm0/fc1/fc2/norm1, and expands blocks.XXX (no index)
+        to blocks.0.XXX ... blocks.(num_blocks-1).XXX.
+        If checkpoint has only blocks.0..blocks.K (e.g. K=3 from .layers.0..3), replicates
+        to fill blocks.0..blocks.(num_blocks-1) by copying from the first available block."""
+        if not isinstance(state, dict):
+            return state
+        out = {}
+        for k, v in state.items():
+            if not isinstance(k, str):
+                out[k] = v
+                continue
+            # .layers.0 -> .0, .layers.1 -> .1, .layers.2 -> .2, .layers.3 -> .3
+            key = k.replace(".layers.0.", ".0.").replace(".layers.1.", ".1.").replace(".layers.2.", ".2.").replace(".layers.3.", ".3.")
+            # time_embedding: JAX and PyTorch both use (Linear, SiLU, Linear) so layers.0→0, layers.2→2; no remap needed.
+            # img_emb.proj.0 -> norm0, proj.1 -> fc1, proj.2 -> fc2, proj.3 -> norm1
+            if key.startswith("img_emb.proj."):
+                key = key.replace("img_emb.proj.0.", "img_emb.norm0.").replace("img_emb.proj.1.", "img_emb.fc1.").replace("img_emb.proj.2.", "img_emb.fc2.").replace("img_emb.proj.3.", "img_emb.norm1.")
+            # patch_embedding.weight/bias -> patch_embedding.conv.weight/bias
+            if key == "patch_embedding.weight":
+                key = "patch_embedding.conv.weight"
+            elif key == "patch_embedding.bias":
+                key = "patch_embedding.conv.bias"
+            # head.0.* (norm) / head.1.* (linear) -> head.norm.* / head.head.* if export uses indices
+            if key.startswith("head.0."):
+                key = key.replace("head.0.", "head.norm.", 1)
+            elif key.startswith("head.1."):
+                key = key.replace("head.1.", "head.head.", 1)
+            # blocks.XXX (no block index) -> blocks.0.XXX, blocks.1.XXX, ... blocks.29.XXX
+            if key.startswith("blocks."):
+                parts = key.split(".", 2)
+                # blocks.modulation or blocks.norm1.weight etc. (exactly two segments)
+                if len(parts) == 2:
+                    suffix = parts[1]
+                    v_tensor = v if isinstance(v, torch.Tensor) else None
+                    if v_tensor is not None and v_tensor.dim() >= 1 and v_tensor.shape[0] == num_blocks:
+                        for i in range(num_blocks):
+                            out[f"blocks.{i}.{suffix}"] = v_tensor[i].clone()
+                    else:
+                        for i in range(num_blocks):
+                            out[f"blocks.{i}.{suffix}"] = v
+                    continue
+                # blocks.norm1.weight, blocks.cross_attn.q.weight, blocks.ffn.0.bias etc. (non-digit middle part)
+                if len(parts) >= 3 and not parts[1].isdigit():
+                    suffix = ".".join(parts[1:])  # full path after blocks. e.g. ffn.0.bias, cross_attn.q.kernel
+                    v_tensor = v if isinstance(v, torch.Tensor) else None
+                    if v_tensor is not None and v_tensor.dim() >= 1 and v_tensor.shape[0] == num_blocks:
+                        for i in range(num_blocks):
+                            out[f"blocks.{i}.{suffix}"] = v_tensor[i].clone()
+                    else:
+                        for i in range(num_blocks):
+                            out[f"blocks.{i}.{suffix}"] = v
+                    continue
+            out[key] = v
+        # Replicate block params if checkpoint has only a subset of block indices (e.g. blocks.0..3 from .layers.0..3)
+        block_suffix_to_idx = {}
+        for key in list(out.keys()):
+            if not key.startswith("blocks."):
+                continue
+            parts = key.split(".", 2)
+            if len(parts) >= 3 and parts[1].isdigit():
+                i, suffix = int(parts[1]), parts[2]
+                block_suffix_to_idx.setdefault(suffix, set()).add(i)
+        for suffix, indices in block_suffix_to_idx.items():
+            missing = set(range(num_blocks)) - indices
+            if not missing:
+                continue
+            source = min(indices)
+            for j in missing:
+                out[f"blocks.{j}.{suffix}"] = out[f"blocks.{source}.{suffix}"]
+        return out
+
+    def _world_model_mp_kernel_to_weight(state):
+        """Convert any remaining Flax .kernel keys to PyTorch .weight (e.g. if state was nested and not converted by _prepare_state)."""
+        if not isinstance(state, dict):
+            return state
+        out = {}
+        for k, v in state.items():
+            if not isinstance(k, str):
+                out[k] = v
+                continue
+            if k.endswith(".kernel") and isinstance(v, torch.Tensor):
+                new_k = k.replace(".kernel", ".weight")
+                if v.dim() == 2:
+                    out[new_k] = v.t().contiguous()
+                elif v.dim() == 4:
+                    out[new_k] = v.permute(3, 2, 0, 1).contiguous()
+                elif v.dim() == 5:
+                    out[new_k] = v.permute(4, 3, 0, 1, 2).contiguous()
+                else:
+                    out[new_k] = v
+            else:
+                out[k] = v
+        return out
+
+    def _world_model_mp_remap_block_keys(state):
+        """Remap checkpoint keys to match PyTorch block structure.
+        Checkpoint (Flax/NNX) block layer order: 0=norm1, 1=self_attn, 2=norm3, 3=cross_attn, 4=norm2, 5=ffn.0, 6=ffn.2.
+        Also supports named keys: blocks.N.norm1.*, blocks.N.cross_attn.*, blocks.N.mouse_mlp.* -> action_model, etc."""
+        if not isinstance(state, dict):
+            return state
+        action_model_parts = {
+            "mouse_mlp", "t_qkv", "keyboard_embed", "img_attn_q_norm", "img_attn_k_norm",
+            "proj_mouse", "key_attn_q_norm", "key_attn_k_norm", "mouse_attn_q",
+            "keyboard_attn_kv", "proj_keyboard",
+        }
+        self_attn_parts = {"q", "k", "v", "o", "norm_q", "norm_k"}
+        cross_attn_parts = {"q", "k", "v", "o", "norm_q", "norm_k"}
+        # Alternate names some checkpoints use for cross-attention (remap to cross_attn)
+        cross_attn_alternate_names = {"enc_attn", "context_attn", "i2v_cross_attn", "cross_attention"}
+        # Flax/NNX block definition order: norm1, self_attn, norm3, cross_attn, norm2, ffn.0, ffn.2
+        # Set LMW_WORLD_MODEL_OLD_BLOCK_ORDER=1 if your checkpoint uses 0=ffn.0, 1=self_attn, 2=ffn.2, 3=cross_attn, 4=norm2 (no norm1/norm3).
+        if os.environ.get("LMW_WORLD_MODEL_OLD_BLOCK_ORDER"):
+            layer_idx_to_module = {"0": "ffn.0", "1": "self_attn", "2": "ffn.2", "3": "cross_attn", "4": "norm2", "5": "ffn"}
+        else:
+            layer_idx_to_module = {
+                "0": "norm1", "1": "self_attn", "2": "norm3", "3": "cross_attn", "4": "norm2",
+                "5": "ffn.0", "6": "ffn.2",
+            }
+        out = {}
+        for k, v in state.items():
+            if not isinstance(k, str):
+                out[k] = v
+                continue
+            if not k.startswith("blocks."):
+                out[k] = v
+                continue
+            parts = k.split(".")
+            if len(parts) < 3:
+                out[k] = v
+                continue
+            try:
+                block_idx = int(parts[1])
+            except ValueError:
+                out[k] = v
+                continue
+            part = parts[2]
+            rest = ".".join(parts[3:]) if len(parts) > 3 else ""
+            prefix = f"blocks.{block_idx}."
+            if part in layer_idx_to_module:
+                sub = layer_idx_to_module[part]
+                # Checkpoint may use numeric indices 0/2 for FFN linears instead of norm1/norm3 (e.g. blocks.0.0.weight = ffn.0).
+                # Use shape: LayerNorm = 1D with dim (48 or 1536); FFN = 2D or 1D with ffn_dim (280 or 8960).
+                if part == "0" and isinstance(v, torch.Tensor):
+                    if v.dim() == 2 or (v.dim() == 1 and v.shape[0] in (280, 8960)):
+                        sub = "ffn.0"
+                elif part == "2" and isinstance(v, torch.Tensor):
+                    if v.dim() == 2:
+                        sub = "ffn.2"
+                    # else: 1D (48 or 1536) stays norm3
+                new_k = f"{prefix}{sub}.{rest}" if rest else f"{prefix}{sub}"
+            elif part in action_model_parts:
+                new_k = f"{prefix}action_model.{part}.{rest}" if rest else f"{prefix}action_model.{part}"
+            elif part in self_attn_parts:
+                new_k = f"{prefix}self_attn.{part}.{rest}" if rest else f"{prefix}self_attn.{part}"
+            elif part in cross_attn_parts:
+                new_k = f"{prefix}cross_attn.{part}.{rest}" if rest else f"{prefix}cross_attn.{part}"
+            elif part in cross_attn_alternate_names:
+                # Checkpoint may name cross-attention enc_attn, context_attn, etc.
+                new_k = f"{prefix}cross_attn.{rest}" if rest else f"{prefix}cross_attn"
+            elif part in ("weight", "bias") and len(parts) == 3:
+                new_k = f"{prefix}norm2.{part}"
+            elif part == "norm1" and isinstance(v, torch.Tensor):
+                # Checkpoint may name ffn.0 (Linear) as norm1: weight (8960,1536) or (1536,8960), bias (8960)
+                if v.dim() == 2 or (v.dim() == 1 and v.shape[0] == 8960):
+                    sub = "ffn.0"
+                    new_k = f"{prefix}{sub}.{rest}" if rest else f"{prefix}{sub}"
+                else:
+                    new_k = k
+            elif part == "norm3" and isinstance(v, torch.Tensor):
+                # Checkpoint may name ffn.2 (Linear) as norm3: weight (1536,8960) or (8960,1536), bias (1536)
+                if v.dim() == 2 or (v.dim() == 1 and v.shape[0] == 1536):
+                    sub = "ffn.2"
+                    new_k = f"{prefix}{sub}.{rest}" if rest else f"{prefix}{sub}"
+                else:
+                    new_k = k
+            elif part in ("norm2", "cross_attn"):
+                new_k = k
+            else:
+                new_k = k
+            out[new_k] = v
+        return out
+
+    def _world_model_mp_unstack_block_params(state, num_blocks=30):
+        """Split checkpoint params that are stacked per block (first dim = num_blocks) into one tensor per block.
+        Checkpoint has e.g. blocks.0.action_model.mouse_mlp.0.weight with shape (30, in, out); model expects
+        blocks.i.action_model.mouse_mlp.0.weight with shape (out, in) for each i. So we slice and transpose."""
+        if not isinstance(state, dict):
+            return state
+        out = {}
+        for k, v in state.items():
+            if not isinstance(k, str) or not k.startswith("blocks."):
+                out[k] = v
+                continue
+            if not isinstance(v, torch.Tensor):
+                out[k] = v
+                continue
+            parts = k.split(".")
+            if len(parts) < 3:
+                out[k] = v
+                continue
+            try:
+                _ = int(parts[1])
+            except ValueError:
+                out[k] = v
+                continue
+            suffix = ".".join(parts[2:])
+            if v.dim() >= 1 and v.shape[0] == num_blocks:
+                for i in range(num_blocks):
+                    block_key = f"blocks.{i}.{suffix}"
+                    vi = v[i]
+                    if vi.dim() == 2:
+                        # Linear weight: checkpoint (in, out), PyTorch wants (out, in)
+                        out[block_key] = vi.t().contiguous()
+                    else:
+                        out[block_key] = vi.contiguous()
+            else:
+                out[k] = v
+        return out
+
+    def _world_model_mp_fill_missing_norms(state, num_blocks=30):
+        """Fill only params that are still missing after remap/align (fallback so load can succeed).
+        Logs when filling so you can confirm checkpoint has norm1/norm3/cross_attn/head if needed."""
+        if not isinstance(state, dict):
+            return state
+        dim = None
+        device = torch.device("cpu")
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                device = v.device
+                if dim is None and k.startswith("blocks.0.self_attn.q.weight") and v.dim() == 2:
+                    dim = v.shape[0]
+                    break
+        if dim is None:
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor) and "blocks." in k and v.dim() == 2:
+                    dim = v.shape[0]
+                    break
+        if dim is None:
+            return state
+        filled = []
+        # norm1, norm3 (LayerNorm)
+        for i in range(num_blocks):
+            for name, default in (("norm1.weight", torch.ones(dim)), ("norm1.bias", torch.zeros(dim)),
+                                  ("norm3.weight", torch.ones(dim)), ("norm3.bias", torch.zeros(dim))):
+                key = f"blocks.{i}.{name}"
+                if key not in state:
+                    state[key] = default.clone().to(device=device)
+                    filled.append(key)
+        # cross_attn (Linear q,k,v,o + RMSNorm norm_q, norm_k) — same layout as self_attn
+        for i in range(num_blocks):
+            for name in ("q", "k", "v", "o"):
+                for wb in ("weight", "bias"):
+                    key = f"blocks.{i}.cross_attn.{name}.{wb}"
+                    if key not in state:
+                        state[key] = (torch.eye(dim) if wb == "weight" else torch.zeros(dim)).clone().to(device=device)
+                        filled.append(key)
+            for name in ("norm_q.weight", "norm_k.weight"):
+                key = f"blocks.{i}.cross_attn.{name}"
+                if key not in state:
+                    state[key] = torch.ones(dim).clone().to(device=device)
+                    filled.append(key)
+        # head.norm (LayerNorm)
+        for name in ("head.norm.weight", "head.norm.bias"):
+            if name not in state:
+                state[name] = (torch.ones(dim) if "weight" in name else torch.zeros(dim)).clone().to(device=device)
+                filled.append(name)
+        if filled:
+            print(f"[LMW] World model: filled {len(filled)} missing params (not in checkpoint): {filled[:20]}{'...' if len(filled) > 20 else ''}")
+        return state
+
     # Load one model at a time and free checkpoint after load to reduce peak memory.
-    # All checkpoints load to CPU (load_device) so we never hold a full ckpt on GPU.
     clip_raw = torch.load(clip_checkpoint_path, map_location=load_device, weights_only=False)
     clip_is_sd = _is_state_dict(clip_raw)
     if clip_is_sd:
         clip_state = _prepare_state(clip_raw.get("state_dict", clip_raw))
+        clip_state = _clip_state_align_keys(clip_state)
         clip_model = TorchCLIPModel(
             embed_dim=1024,
             image_size=224,
@@ -217,7 +533,7 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
             embedding_dropout=0.0,
             norm_eps=1e-5,
         )
-        clip_model.load_state_dict(clip_state, strict=False)
+        clip_model.load_state_dict(clip_state, strict=True)
         del clip_raw
     else:
         if not isinstance(clip_raw, torch.nn.Module):
@@ -227,10 +543,11 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    vae_raw = torch.load(vae_checkpoint_path, map_location=load_device, weights_only=False)
+    vae_raw = torch.load(vae_checkpoint_path, map_location=load_device, weights_only=True)
     vae_is_sd = _is_state_dict(vae_raw)
     if vae_is_sd:
         vae_state = _prepare_state(vae_raw.get("state_dict", vae_raw))
+        vae_state = _vae_state_align_conv_keys(vae_state)
         vae_model = WanVAETorch(
             dim=96,
             z_dim=16,
@@ -241,7 +558,10 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
             dropout=0.0,
         )
         vae_state = _vae_state_align_shapes(vae_state, vae_model)
-        vae_model.load_state_dict(vae_state, strict=False)
+        # Drop Flax-only keys (e.g. rngs.default.count) so strict load does not see unexpected keys
+        model_keys = set(vae_model.state_dict().keys())
+        vae_state = {k: v for k, v in vae_state.items() if k in model_keys}
+        vae_model.load_state_dict(vae_state, strict=True)
         del vae_raw
     else:
         if not isinstance(vae_raw, torch.nn.Module):
@@ -256,29 +576,52 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
     world_is_sd = _is_state_dict(world_raw)
     if world_is_sd:
         world_state = _prepare_state(world_raw.get("state_dict", world_raw))
+        world_state = _world_model_mp_state_align(world_state, num_blocks=30)
+        world_state = _world_model_mp_kernel_to_weight(world_state)
+        world_state = _world_model_mp_remap_block_keys(world_state)
+        world_state = _world_model_mp_unstack_block_params(world_state, num_blocks=30)
+        world_state = _world_model_mp_fill_missing_norms(world_state, num_blocks=30)
+        # World model config: must match checkpoint shapes for load_state_dict(strict=True).
+        # Defaults are for the full model (dim=1536). For solaris.pt / 48-dim checkpoint set:
+        #   LMW_WORLD_MODEL_DIM=48
+        #   LMW_WORLD_MODEL_FFN_DIM=280   (from blocks.ffn.layers.0.bias (30,280); kernel has 8960 but bias defines out_dim)
+        #   LMW_WORLD_MODEL_FREQ_DIM=8    (from time_embedding.layers.0.kernel (8, 1536))
+        #   LMW_WORLD_MODEL_NUM_HEADS=12  (dim 48 / 12 = 4; or 6 for 8)
+        #   LMW_ACTION_MOUSE_HIDDEN_DIM=32
+        #   LMW_ACTION_KEYBOARD_HIDDEN_DIM=32
+        #   LMW_ACTION_HIDDEN_SIZE=4       (keyboard_embed layers.0 out in checkpoint)
+        _dim = int(os.environ.get("LMW_WORLD_MODEL_DIM", "1536"))
+        _ffn_dim = int(os.environ.get("LMW_WORLD_MODEL_FFN_DIM", "8960"))
+        _freq_dim = int(os.environ.get("LMW_WORLD_MODEL_FREQ_DIM", "256"))
+        _num_heads = int(os.environ.get("LMW_WORLD_MODEL_NUM_HEADS", "12"))
+        # Action module: optional overrides to match small checkpoints (e.g. mouse_hidden_dim=32, hidden_size=4).
+        _action_hidden = int(os.environ.get("LMW_ACTION_HIDDEN_SIZE", "128"))
+        _action_img = int(os.environ.get("LMW_ACTION_IMG_HIDDEN_SIZE", "1536"))  # CLIP/context dim, usually 1536
+        _action_kb = int(os.environ.get("LMW_ACTION_KEYBOARD_HIDDEN_DIM", "1024"))
+        _action_mouse = int(os.environ.get("LMW_ACTION_MOUSE_HIDDEN_DIM", "1024"))
         world_model = SolarisMPModelTorch(
             model_type="i2v",
             patch_size=(1, 2, 2),
             text_len=512,
             in_dim=36,
-            dim=1536,
-            ffn_dim=8960,
-            freq_dim=256,
-            text_dim=4096,
+            dim=_dim,
+            ffn_dim=_ffn_dim,
+            freq_dim=_freq_dim,
+            # text_dim=4096,
             out_dim=16,
-            num_heads=12,
+            num_heads=_num_heads,
             num_layers=30,
             local_attn_size=6,
             sink_size=0,
             qk_norm=True,
-            cross_attn_norm=True,
+            cross_attn_norm=False,
             action_config=dict(
                 mouse_dim_in=2,
-                keyboard_dim_in=6,
-                hidden_size=128,
-                img_hidden_size=1536,
-                keyboard_hidden_dim=1024,
-                mouse_hidden_dim=1024,
+                keyboard_dim_in=23,  # match action_BPFD[:,:,:,:-2] (all but last 2 mouse dims)
+                hidden_size=_action_hidden,
+                img_hidden_size=_action_img,
+                keyboard_hidden_dim=_action_kb,
+                mouse_hidden_dim=_action_mouse,
                 vae_time_compression_ratio=4,
                 windows_size=3,
                 heads_num=16,
@@ -297,7 +640,15 @@ def load_models(model_weights_path, clip_checkpoint_path, vae_checkpoint_path, d
             multiplayer_method="multiplayer_attn",
             num_players=2,
         )
-        world_model.load_state_dict(world_state, strict=False)
+        # Optional: set LMW_DEBUG_LOAD=1 to log missing/unexpected keys (sanity check for garbage video)
+        if os.environ.get("LMW_DEBUG_LOAD"):
+            missing, unexpected = world_model.load_state_dict(world_state, strict=False)
+            if missing:
+                print(f"[LMW] World model missing_keys (first 30): {missing[:30]}")
+            if unexpected:
+                print(f"[LMW] World model unexpected_keys (first 30): {unexpected[:30]}")
+        else:
+            world_model.load_state_dict(world_state, strict=True)
         del world_raw
     else:
         if not isinstance(world_raw, torch.nn.Module):
@@ -453,40 +804,55 @@ def run_evaluate(
         )
 
     final_frame_BPFHWC = handle_multiplayer_output(
-        final_frame_BPFHWC.cpu().numpy(),
+        final_frame_BPFHWC.cpu().float().numpy(),
         multiplayer_method,
         num_players=2,
     )
     final_frame_BPFHWC = torch.from_numpy(final_frame_BPFHWC).to(
         device=device, dtype=model_dtype
     )
+
+    del clip_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     B = final_frame_BPFHWC.shape[0]
+    P = final_frame_BPFHWC.shape[1]
+    F_latent = final_frame_BPFHWC.shape[2]
+    CHUNK_FRAMES = 4
 
-    if offload:
-        with offload_to(device, vae_model):
-            decoded = vae_model.decode(
-                rearrange(final_frame_BPFHWC, "b p f h w c -> (b p) f h w c"),
-                scale=scale_torch,
-            )
-    else:
-        decoded = vae_model.decode(
-            rearrange(final_frame_BPFHWC, "b p f h w c -> (b p) f h w c"),
-            scale=scale_torch,
-        )
-
+    decoded_list = []
+    for b in tqdm(range(B)):
+        for p in range(P):
+            latent_bpf = final_frame_BPFHWC[b, p]  # (F, h, w, c)
+            chunks_out = []
+            for start in range(0, F_latent, CHUNK_FRAMES):
+                end = min(start + CHUNK_FRAMES, F_latent)
+                chunk = latent_bpf[start:end].unsqueeze(0)  # (1, chunk_len, h, w, c)
+                chunk = chunk.to(device=device, dtype=final_frame_BPFHWC.dtype)
+                if offload:
+                    with offload_to(device, vae_model):
+                        out_chunk = vae_model.decode(chunk, scale=scale_torch)
+                else:
+                    out_chunk = vae_model.decode(chunk, scale=scale_torch)
+                chunks_out.append(out_chunk.cpu())
+            decoded_bpf = torch.cat(chunks_out, dim=1)
+            decoded_list.append(decoded_bpf)
+    decoded = torch.cat(decoded_list, dim=0)
     decoded = rearrange(decoded, "(b p) f h w c -> b p f h w c", b=B)
     decoded_uint8 = change_tensor_range_torch(decoded, [-1.0, 1.0], [0, 255])
     os.makedirs(eval_save_dir, exist_ok=True)
     rollout_np = decoded_uint8.cpu().numpy()
-    gt_np = video_uint8.cpu().numpy()
-    side_by_side = np.concatenate([gt_np, rollout_np], axis=4)
-    side_by_side_BFHWC = rearrange(side_by_side, "b p f h w c -> b f (p h) w c")
-    for i in range(side_by_side_BFHWC.shape[0]):
+    # Save final decoded video only (no concat with gt to avoid shape mismatch)
+    rollout_BFHWC = rearrange(rollout_np, "b p f h w c -> b f (p h) w c")
+    for i in range(rollout_BFHWC.shape[0]):
         write_video(
-            os.path.join(eval_save_dir, f"video_{i}_side_by_side.mp4"),
-            side_by_side_BFHWC[i],
+            os.path.join(eval_save_dir, f"video_{i}_rollout.mp4"),
+            rollout_BFHWC[i],
             fps=20,
         )
+    gt_np = video_uint8.cpu().numpy()
     from metrics.compute_metrics import FIDCalculator, calculate_metrics_from_batch
     metrics = ["fid"]
     n_prompt_frames = 1

@@ -19,10 +19,10 @@ def sinusoidal_embedding_1d(dim, position, device=None):
 
 
 def rope_params(max_seq_len, dim, theta=10000.0, device=None):
-    """RoPE freqs complex [max_seq_len, dim//2]."""
+    """RoPE freqs complex [max_seq_len, dim//2]. Matches JAX: arange(0, dim, 2) / dim."""
     assert dim % 2 == 0
-    half = dim // 2
-    inv_freq = 1.0 / (theta ** (torch.arange(0, half, 2, dtype=torch.float32, device=device) / dim))
+    # JAX: jnp.arange(0, dim, 2) / dim -> dim/2 elements; do not use half = dim//2 then arange(0, half, 2)
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
     pos = torch.arange(max_seq_len, dtype=torch.float32, device=device)
     freqs = torch.outer(pos, inv_freq)
     return torch.polar(torch.ones_like(freqs), freqs)
@@ -44,15 +44,25 @@ def _rope_apply_3d(x, grid_sizes, freqs, start_frame=0, device=None):
     """x: (B, S, N, D). Apply 3D RoPE from concatenated freqs (3 parts)."""
     f, h, w = grid_sizes
     _, _, n, d_total = x.shape
+    # RoPE is applied in complex form: x has d_total real dims = d_total//2 complex; freqs must match
     c = d_total // 2
-    split_boundaries = [c - 2 * (c // 3), c - 2 * (c // 3) + c // 3]
-    freqs_list = torch.split(freqs, split_boundaries, dim=1)
+    if freqs.shape[1] < c:
+        # Caller passed freqs for a smaller head_dim (e.g. wrong config); build correct one from x
+        max_seq_len = freqs.shape[0]
+        dev = device if device is not None else x.device
+        freqs = rope_params_mp(d_total, max_seq_len=max_seq_len, device=dev)
+    freqs = freqs[:, :c]
+    part0 = c - 2 * (c // 3)
+    part1 = c // 3
+    part2 = c // 3
+    freqs_list = torch.split(freqs, [part0, part1, part2], dim=1)
     seq_len = f * h * w
     sliced_t = freqs_list[0][start_frame : start_frame + f]
     d0, d1, d2 = [u.shape[1] for u in freqs_list]
     t_3d = sliced_t.reshape(f, 1, 1, d0).expand(f, h, w, d0).reshape(1, seq_len, 1, d0)
-    h_3d = freqs_list[1][:h].reshape(1, h, 1, d1).expand(1, h, w, d1).reshape(1, seq_len, 1, d1)
-    w_3d = freqs_list[2][:w].reshape(1, 1, w, d2).expand(1, h, w, d2).reshape(1, seq_len, 1, d2)
+    # Expand spatial RoPE over frames so (1, h, w) -> (f, h, w) before reshaping to seq_len
+    h_3d = freqs_list[1][:h].reshape(1, h, 1, d1).expand(f, h, w, d1).reshape(1, seq_len, 1, d1)
+    w_3d = freqs_list[2][:w].reshape(1, 1, w, d2).expand(f, h, w, d2).reshape(1, seq_len, 1, d2)
     freqs_3d = torch.cat([t_3d, h_3d, w_3d], dim=-1)
     x_float = x.float().reshape(*x.shape[:-1], -1, 2)
     x_complex = torch.complex(x_float[..., 0], x_float[..., 1])

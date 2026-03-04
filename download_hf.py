@@ -40,15 +40,15 @@ def main(args):
 
     # repo_id = args.repo_id
     # local_dir = args.local_dir
-    repo_type = "dataset"  # "model", "dataset", or "space"
+    repo_type = "nyu-visionx/solaris"
     token = None  # Set to your HF token if needed for private repos
     revision = None  # Set to specific branch/tag/commit if needed
     
     # Download the repository
     download_hf_repo(
-        repo_id="tungdnguyen/pickapic-5k-animated-flipped-30pct",
-        local_dir="datasets/pickapic-5k-animated-flipped-30pct",
-        repo_type=repo_type,
+        repo_id=repo_type,
+        local_dir="checkpoints/",
+        repo_type="model",
     )
 
 

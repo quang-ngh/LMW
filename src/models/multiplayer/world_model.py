@@ -276,7 +276,7 @@ class SolarisMPBlock(nnx.Module):
         action_config={},
         action_module=False,
         eps=1e-6,
-        rngs=nnx.Rngs(0),
+        rngs=nnx.Rngs(0),``
         platform="tpu",
     ):
         super().__init__()

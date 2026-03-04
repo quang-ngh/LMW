@@ -26,10 +26,11 @@ class WanLayerNorm(nn.LayerNorm):
         super().__init__(num_features, eps=eps, elementwise_affine=elementwise_affine)
 
     def forward(self, x):
-        dtype = x.dtype
-        if dtype == torch.bfloat16:
-            x = super().forward(x.float()).to(dtype)
-            return x
+        # dtype = x.dtype
+        # if dtype == torch.bfloat16:
+        #     x = super().forward(x.float()).to(dtype)
+        #     return x
+        # return super().forward(x)
         return super().forward(x)
 
 
@@ -84,9 +85,9 @@ def _rope_apply_torch(x, grid_sizes, freqs, start_frame=0):
 
 
 def rope_params_torch(max_seq_len, dim, theta=10000.0, device=None):
-    """RoPE freqs complex (max_seq_len, dim//2)."""
-    half = dim // 2
-    inv_freq = 1.0 / (theta ** (torch.arange(0, half, 2, dtype=torch.float32, device=device) / dim))
+    """RoPE freqs complex (max_seq_len, dim//2). Matches JAX: arange(0, dim, 2) / dim."""
+    assert dim % 2 == 0, "dim must be even"
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
     pos = torch.arange(max_seq_len, dtype=torch.float32, device=device)
     freqs = torch.outer(pos, inv_freq)
     return torch.polar(torch.ones_like(freqs), freqs)  # e^(i*freqs)
@@ -113,16 +114,13 @@ class WanSelfAttention(nn.Module):
         v = self.v(x).view(b, s, n, d)
         q = _rope_apply_torch(q, grid_sizes, freqs)
         k = _rope_apply_torch(k, grid_sizes, freqs)
-        q = q.transpose(1, 2)  # (B, N, S, D)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
         scale = d ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if block_mask is not None:
-            attn = attn.masked_fill(~block_mask, float("-inf"))
-        attn = attn.softmax(dim=-1)
-        x = torch.matmul(attn, v)
-        x = x.transpose(1, 2).reshape(b, s, self.dim)
+        # scaled_dot_product_attention expects (B, S, N, D); uses Flash Attention when available
+        attn_mask = None if block_mask is None else ~block_mask  # SDPA: True = mask out
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=0.0, scale=scale
+        )
+        x = x.reshape(b, s, self.dim)
         return self.o(x)
 
 
@@ -144,9 +142,9 @@ class WanI2VCrossAttention(nn.Module):
         k = rearrange(self.norm_k(self.k(context_btd)), "b t (n d) -> b t n d", n=self.num_heads)
         v = rearrange(self.v(context_btd), "b t (n d) -> b t n d", n=self.num_heads)
         scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = attn.softmax(dim=-1)
-        x = torch.matmul(attn, v)
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, dropout_p=0.0, scale=scale
+        )
         x = rearrange(x, "b s n d -> b s (n d)")
         return self.o(x)
 
@@ -160,16 +158,9 @@ class MLPProj(nn.Module):
         self.norm1 = nn.LayerNorm(out_dim, eps=1e-5)
 
     def forward(self, x):
-        dtype = x.dtype
-        if dtype == torch.bfloat16:
-            x = self.norm0(x.float()).to(dtype)
-        else:
-            x = self.norm0(x)
+        x = self.norm0(x)
         x = self.fc1(x)
         x = torch.nn.functional.gelu(x, approximate="tanh")
         x = self.fc2(x)
-        if dtype == torch.bfloat16:
-            x = self.norm1(x.float()).to(dtype)
-        else:
-            x = self.norm1(x)
+        x = self.norm1(x)
         return x

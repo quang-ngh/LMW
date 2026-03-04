@@ -153,8 +153,8 @@ class ActionModuleTorch(nn.Module):
 
         if self.enable_mouse and mouse_condition is not None:
             hidden_states = (
-                x.reshape(B, tt, th * tw, x.shape[-1])
-                .transpose(0, 2, 1, 3)
+                x.reshape(B, tt, th * tw, x.shape[-1]) \
+                .permute(0, 2, 1, 3) \
                 .reshape(B * th * tw, tt, x.shape[-1])
             )
         else:
@@ -288,7 +288,7 @@ class ActionModuleTorch(nn.Module):
             T_ = TS // S
             q_blhd = (
                 q_blhd.reshape(B, T_, S, H, D)
-                .transpose(0, 2, 1, 3, 4)
+                .permute(0, 2, 1, 3, 4)
                 .reshape(B * S, T_, H, D)
             )
 
@@ -349,12 +349,10 @@ class ActionModuleTorch(nn.Module):
             k = k_blhd.transpose(1, 2)
             v = v_blhd.transpose(1, 2)
             scale = q.shape[-1] ** -0.5
-            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-            if block_mask is not None:
-                attn = attn.masked_fill(~block_mask, float("-inf"))
-            attn = attn.softmax(dim=-1)
-            x = torch.matmul(attn, v)
-            x = x.transpose(1, 2).reshape(q_blhd.shape[0], q_blhd.shape[1], -1)
+            x = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=block_mask, scale=scale, dropout_p=0.0
+            )
+            x = x.transpose(1, 2)
             return x, None
         else:
             new_kv_cache = kv_cache.update(k_blhd, v_blhd)
@@ -365,20 +363,15 @@ class ActionModuleTorch(nn.Module):
                 k = k.repeat(repeat_factor, 1, 1, 1)
                 v = v.repeat(repeat_factor, 1, 1, 1)
             kv_len = k.shape[1]
-            # Valid cache positions: last `length` positions; mask out the rest for SDPA (True = mask out).
-            mask_invalid = torch.arange(kv_len, device=k.device) < (
-                kv_len - new_kv_cache.length.item()
-            )
-            mask_bool = mask_invalid.view(1, 1, 1, kv_len).expand(
-                q_blhd.shape[0], 1, q_blhd.shape[1], kv_len
-            )
+            # SDPA: True = attend, False = mask out. Valid keys are the last `length` positions.
+            valid_len = new_kv_cache.length.item() if isinstance(new_kv_cache.length, torch.Tensor) else new_kv_cache.length
+            attn_mask = (torch.arange(kv_len, device=k.device) >= (kv_len - valid_len))[None, None, None, :]
             q = q_blhd.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
             scale = q.shape[-1] ** -0.5
-            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-            attn = attn.masked_fill(mask_bool, float("-inf"))
-            attn = attn.softmax(dim=-1)
-            x = torch.matmul(attn, v)
-            x = x.transpose(1, 2).reshape(q_blhd.shape[0], q_blhd.shape[1], -1)
+            x = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, scale=scale, dropout_p=0.0
+            )
+            x = x.transpose(1, 2)
             return x, new_kv_cache

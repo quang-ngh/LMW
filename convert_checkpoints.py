@@ -227,63 +227,63 @@ def main():
     # ------------------------------------------------------------------
     # 3. Multiplayer world-model checkpoints
     # ------------------------------------------------------------------
-    mp_names = [
-        "solaris.pt",
-        "mp_bidirectional_120000.pt",
-        "mp_causal_60000.pt",
-    ]
-    for name in mp_names:
-        path = os.path.join(ckpt_dir, name)
-        if os.path.isdir(path):
-            print(f"[MP world-model] {name}")
-            model = _make_mp_model(multiplayer_method="multiplayer_attn")
-            try:
-                convert_checkpoint(path, model, os.path.join(out_dir, name))
-            except Exception as exc:
-                print(f"  FAILED: {exc}")
-            del model
-            print()
+    # mp_names = [
+    #     "solaris.pt",
+    #     # "mp_bidirectional_120000.pt",
+    #     # "mp_causal_60000.pt",
+    # ]
+    # for name in mp_names:
+    #     path = os.path.join(ckpt_dir, name)
+    #     if os.path.isdir(path):
+    #         print(f"[MP world-model] {name}")
+    #         model = _make_mp_model(multiplayer_method="multiplayer_attn")
+    #         try:
+    #             convert_checkpoint(path, model, os.path.join(out_dir, name))
+    #         except Exception as exc:
+    #             print(f"  FAILED: {exc}")
+    #         del model
+    #         print()
 
-    # ------------------------------------------------------------------
-    # 4. Single-player world-model checkpoints
-    # ------------------------------------------------------------------
-    sp_names = [
-        "sp_bidirectional_pretrain_120000.pt",
-    ]
-    for name in sp_names:
-        path = os.path.join(ckpt_dir, name)
-        if os.path.isdir(path):
-            print(f"[SP world-model] {name}")
-            model = _make_sp_model()
-            try:
-                convert_checkpoint(path, model, os.path.join(out_dir, name))
-            except Exception as exc:
-                print(f"  FAILED: {exc}")
-            del model
-            print()
+    # # ------------------------------------------------------------------
+    # # 4. Single-player world-model checkpoints
+    # # ------------------------------------------------------------------
+    # sp_names = [
+    #     "sp_bidirectional_pretrain_120000.pt",
+    # ]
+    # for name in sp_names:
+    #     path = os.path.join(ckpt_dir, name)
+    #     if os.path.isdir(path):
+    #         print(f"[SP world-model] {name}")
+    #         model = _make_sp_model()
+    #         try:
+    #             convert_checkpoint(path, model, os.path.join(out_dir, name))
+    #         except Exception as exc:
+    #             print(f"  FAILED: {exc}")
+    #         del model
+    #         print()
 
     # ------------------------------------------------------------------
     # 5. matrix-game-init  (try MP first, fallback to SP)
     # ------------------------------------------------------------------
-    init_path = os.path.join(ckpt_dir, "matrix-game-init.pt")
-    if os.path.isdir(init_path):
-        print("[matrix-game-init]")
-        converted = False
-        for label, factory in [("MP", _make_mp_model), ("SP", _make_sp_model)]:
-            try:
-                model = factory()
-                convert_checkpoint(
-                    init_path, model, os.path.join(out_dir, "matrix-game-init.pt")
-                )
-                converted = True
-                del model
-                break
-            except Exception as exc:
-                print(f"  {label} attempt failed: {exc}")
-                del model
-        if not converted:
-            print("  Skipping matrix-game-init.pt (could not match model).")
-        print()
+    # init_path = os.path.join(ckpt_dir, "matrix-game-init.pt")
+    # if os.path.isdir(init_path):
+    #     print("[matrix-game-init]")
+    #     converted = False
+    #     for label, factory in [("MP", _make_mp_model), ("SP", _make_sp_model)]:
+    #         try:
+    #             model = factory()
+    #             convert_checkpoint(
+    #                 init_path, model, os.path.join(out_dir, "matrix-game-init.pt")
+    #             )
+    #             converted = True
+    #             del model
+    #             break
+    #         except Exception as exc:
+    #             print(f"  {label} attempt failed: {exc}")
+    #             del model
+    #     if not converted:
+    #         print("  Skipping matrix-game-init.pt (could not match model).")
+    #     print()
 
     print("Done.")
 

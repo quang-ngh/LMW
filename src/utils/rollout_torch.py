@@ -121,6 +121,7 @@ def fully_denoise_frame_bidirectional_multiplayer_torch(
     inference_timesteps = flow_match_inference_timesteps_torch(
         num_denoising_steps, device=device
     )
+    print(f"inference_timesteps: {inference_timesteps}")
     sigma_t = inference_timesteps / 1000.0
     B, P, F, Hl, Wl, latent_c = frame_noise_BPFHWC.shape
 

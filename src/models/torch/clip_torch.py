@@ -85,7 +85,7 @@ class VisionTransformer(nn.Module):
         self.num_patches = (image_size // patch_size) ** 2
         gain = 1.0 / math.sqrt(dim)
         self.patch_embedding = nn.Conv2d(
-            3, dim, kernel_size=patch_size, stride=patch_size
+            3, dim, kernel_size=patch_size, stride=patch_size, bias=False
         )
         if pool_type in ("token", "token_fc"):
             self.cls_embedding = nn.Parameter(gain * torch.randn(1, 1, dim))
